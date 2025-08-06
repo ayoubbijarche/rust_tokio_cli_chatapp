@@ -159,6 +159,24 @@ impl ChatServer {
     }
 }
 
+
+
+struct ChatClient{
+    username : String
+}
+
+impl ChatClient{
+    
+    fn new(username : String) -> Self {
+        Self { username }
+    }
+
+    async fn connect
+
+}
+
+
+
 #[tokio::main]
 
 async fn main() -> anyhow::Result<()> {
