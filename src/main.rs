@@ -27,7 +27,6 @@ struct ChatServer {
 impl ChatServer {
     fn new() -> Self {
         let (tx, _rx) = broadcast::channel(1000);
-
         Self {
             tx,
             clients: Arc::new(Mutex::new(HashMap::new())),
@@ -71,6 +70,7 @@ impl ChatServer {
             .and_then(|u| u.as_str())
             .ok_or("Invalid username format")?
             .to_string();
+
         {
             let mut clients_guard = clients.lock().await;
             clients_guard.insert(addr, username.clone());
@@ -89,13 +89,15 @@ impl ChatServer {
 
         let _ = tx.send(join_msg);
 
+        let (mut sink, mut stream) = framed.split();
+
         let tx_clone = tx.clone();
         let username_clone = username.clone();
         let clients_clone = clients.clone();
         let addr_clone = addr.clone();
 
         let read_task = tokio::spawn(async move {
-            while let Some(result) = framed.next().await {
+            while let Some(result) = stream.next().await {
                 match result {
                     Ok(line) => {
                         if let Ok(mut msg) = serde_json::from_str::<ChatMessage>(&line) {
@@ -134,18 +136,16 @@ impl ChatServer {
             let _ = tx_clone.send(leave_msg);
         });
 
+        let username_for_write = username.clone();
         let write_task = tokio::spawn(async move {
             while let Ok(msg) = rx.recv().await {
-
-                /*
-                if msg.Username != username {
+                if msg.Username != username_for_write {
                     let json_msg = serde_json::to_string(&msg).unwrap();
-                    if let Err(e) = framed.send(json_msg).await {
+                    if let Err(e) = sink.send(json_msg).await {
                         println!("Error sending to client: {}", e);
                         break;
                     }
                 }
-                */
             }
         });
 
@@ -159,26 +159,122 @@ impl ChatServer {
     }
 }
 
-
-
-struct ChatClient{
-    username : String
+struct ChatClient {
+    username: String
 }
 
-impl ChatClient{
-    
-    fn new(username : String) -> Self {
+impl ChatClient {
+    fn new(username: String) -> Self {
         Self { username }
     }
 
-    async fn connect
+    async fn connect(&self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let stream = TcpStream::connect(addr).await?;
+        println!("Connected to server at {}", addr);
 
+        let mut framed = Framed::new(stream, LinesCodec::new());
+
+        let username_msg = serde_json::json!({"username": self.username});
+        framed.send(serde_json::to_string(&username_msg)?).await?;
+
+        let stdin = stdin();
+        let mut stdin_reader = BufReader::new(stdin).lines();
+
+        let (mut sink, mut stream) = framed.split();
+
+        let username_clone = self.username.clone();
+        let input_task = tokio::spawn(async move {
+            while let Ok(Some(line)) = stdin_reader.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                let msg = ChatMessage {
+                    Username: username_clone.clone(),
+                    Content: line.trim().to_string(),
+                    Timestamp: 0,
+                };
+
+                let json_msg = serde_json::to_string(&msg).unwrap();
+                if let Err(e) = sink.send(json_msg).await {
+                    println!("Error sending message: {}", e);
+                    break;
+                }
+            }
+        });
+
+        let receive_task = tokio::spawn(async move {
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(line) => {
+                        if let Ok(msg) = serde_json::from_str::<ChatMessage>(&line) {
+                            let datetime = std::time::UNIX_EPOCH +
+                                std::time::Duration::from_secs(msg.Timestamp);
+                            let formatted_time = format!("{:?}", datetime);
+
+                            println!("[{}] {}: {}",
+                                     formatted_time.split('.').next().unwrap_or(""),
+                                     msg.Username,
+                                     msg.Content
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!("Error receiving message: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = input_task => {},
+            _ = receive_task => {},
+        }
+
+        Ok(())
+    }
 }
 
-
-
 #[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
 
-async fn main() -> anyhow::Result<()> {
+    if args.len() < 2 {
+        println!("Usage:");
+        println!("  Server mode: {} server [port]", args[0]);
+        println!("  Client mode: {} client <username> [server_addr]", args[0]);
+        return Ok(());
+    }
+
+    match args[1].as_str() {
+        "server" => {
+            let port = args.get(2).unwrap_or(&"8080".to_string()).clone();
+            let addr = format!("127.0.0.1:{}", port);
+
+            let server = ChatServer::new();
+            server.run_server(&addr).await?;
+        }
+        "client" => {
+            if args.len() < 3 {
+                println!("Please provide a username");
+                return Ok(());
+            }
+
+            let username = args[2].clone();
+            let server_addr = args.get(3).unwrap_or(&"127.0.0.1:8080".to_string()).clone();
+
+            let client = ChatClient::new(username);
+
+            println!("Connecting to {}...", server_addr);
+            println!("Type messages and press Enter to send. Ctrl+C to quit.");
+
+            client.connect(&server_addr).await?;
+        }
+        _ => {
+            println!("Invalid mode. Use 'server' or 'client'");
+        }
+    }
+
     Ok(())
 }
